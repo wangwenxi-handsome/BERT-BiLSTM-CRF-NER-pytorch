@@ -118,9 +118,13 @@ def convert_examples_to_features(args, examples, label_list, max_seq_length, tok
 
         for i, word in enumerate(textlist):
             # 防止wordPiece情况出现，不过貌似不会
-            
             token = tokenizer.tokenize(word)
+
+            # NOTE: 修复无法识别的字符
+            if len(token) == 0:
+                token = ["MASK"]
             tokens.extend(token)
+
             label_1 = labellist[i]
             ori_tokens.append(word)
 
@@ -160,7 +164,7 @@ def convert_examples_to_features(args, examples, label_list, max_seq_length, tok
         
         input_mask = [1] * len(input_ids)
 
-        assert len(ori_tokens) == len(ntokens), f"{len(ori_tokens)}, {len(ntokens)}, {ori_tokens}"
+        assert len(ori_tokens) == len(ntokens), f"{len(ori_tokens)}, {len(ntokens)}, {ori_tokens}, {ntokens}"
 
         while len(input_ids) < max_seq_length:
             input_ids.append(0)
@@ -212,8 +216,13 @@ def get_Dataset(args, processor, tokenizer, mode="train"):
     examples = processor.get_examples(filepath)
     label_list = args.label_list
 
+    if mode == "test":
+        max_seq_length = 128
+    else:
+        max_seq_length = 32
+
     features = convert_examples_to_features(
-        args, examples, label_list, args.max_seq_length, tokenizer
+        args, examples, label_list, max_seq_length, tokenizer
     )
 
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
@@ -225,3 +234,30 @@ def get_Dataset(args, processor, tokenizer, mode="train"):
 
     return examples, features, data
 
+
+def convert_bio2bieso(labels):
+    new_labels = []
+
+    i = 0
+    while(i < len(labels)):
+        if labels[i].split("-")[0] == "B":
+            # 如果是一个单实体
+            if i + 1 == len(labels) or labels[i + 1] != "I-" + labels[i].split("-")[1]:
+                new_labels.append("S-" + labels[i].split("-")[1])
+            # 如果是一个长实体
+            else:
+                tag = labels[i].split("-")[1]
+                while(i + 1 < len(labels) and labels[i + 1] == "I-" + tag):
+                    new_labels.append(labels[i])
+                    i += 1
+                new_labels.append("E-" + tag)
+
+        elif labels[i].split("-")[0] == "I":
+            new_labels.append("S-" + labels[i].split("-")[1])
+
+        else:
+            new_labels.append(labels[i])
+        
+        i += 1
+
+    return new_labels

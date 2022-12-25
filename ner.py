@@ -20,12 +20,12 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 from tensorboardX import SummaryWriter
 
-from utils import NerProcessor, convert_examples_to_features, get_Dataset
-from models import BERT_BiLSTM_CRF
+from utils import NerProcessor, convert_examples_to_features, get_Dataset, convert_bio2bieso
+from models import BERT_BiLSTM_CRF, FGM
 import conlleval
 
-from pytorch_transformers import (WEIGHTS_NAME, BertConfig, BertTokenizer)
-from pytorch_transformers import AdamW, WarmupLinearSchedule
+from transformers import AutoConfig, AutoTokenizer, AutoModel, AutoModelForMaskedLM
+from pytorch_transformers import WarmupLinearSchedule
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +34,12 @@ def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if args.n_gpu > 0:
-        torch.cuda.manual_seed_all(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(args.seed)
+
 
 def to_list(tensor):
     return tensor.detach().cpu().tolist()
@@ -117,11 +121,12 @@ def main():
     parser.add_argument("--train_batch_size", default=8, type=int)
     parser.add_argument("--eval_batch_size", default=8, type=int)
     parser.add_argument("--learning_rate", default=3e-5, type=float)
+    parser.add_argument("--weight_decay", default=0.01, type=float)
     parser.add_argument("--num_train_epochs", default=10, type=float)
     parser.add_argument("--warmup_proprotion", default=0.1, type=float)
     parser.add_argument("--use_weight", default=1, type=int)
     parser.add_argument("--local_rank", type=int, default=-1)
-    parser.add_argument("--seed", type=int, default=2019)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fp16", default=False)
     parser.add_argument("--loss_scale", type=float, default=0)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
@@ -135,7 +140,11 @@ def main():
     parser.add_argument("--need_birnn", default=False, type=boolean_string)
     parser.add_argument("--rnn_dim", default=128, type=int)
 
+    parser.add_argument("--fgm", default=True, type=boolean_string)
+
     args = parser.parse_args()
+
+    set_seed(args)
 
     device = torch.device("cuda")
     # os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_
@@ -205,12 +214,10 @@ def main():
     # Prepare optimizer and schedule (linear warmup and decay)
 
     if args.do_train:
-
-        tokenizer = BertTokenizer.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path, 
-                    do_lower_case=args.do_lower_case)
-        config = BertConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path, 
-                num_labels=num_labels)
-        model = BERT_BiLSTM_CRF.from_pretrained(args.model_name_or_path, config=config, 
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
+        config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
+        encoder = AutoModel.from_pretrained(args.model_name_or_path, config=config)
+        model = BERT_BiLSTM_CRF(encoder=encoder, config=config, 
                 need_birnn=args.need_birnn, rnn_dim=args.rnn_dim)
 
         model.to(device)
@@ -231,13 +238,35 @@ def main():
         else:
             t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
+        # grouped llrd
+        # https://arxiv.org/pdf/1905.05583.pdf
+        no_decay = ["bias", "LayerNorm.weight"]
+        group1=['layer.0.','layer.1.','layer.2.','layer.3.']
+        group2=['layer.4.','layer.5.','layer.6.','layer.7.']    
+        group3=['layer.8.','layer.9.','layer.10.','layer.11.']
+        group_all=['layer.0.','layer.1.','layer.2.','layer.3.','layer.4.','layer.5.','layer.6.','layer.7.','layer.8.','layer.9.','layer.10.','layer.11.']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in model.bert.named_parameters() if not any(nd in n for nd in no_decay) and not any(nd in n for nd in group_all)],'weight_decay': args.weight_decay},
+            {'params': [p for n, p in model.bert.named_parameters() if not any(nd in n for nd in no_decay) and any(nd in n for nd in group1)],'weight_decay': args.weight_decay, 'lr': args.learning_rate/2.6},
+            {'params': [p for n, p in model.bert.named_parameters() if not any(nd in n for nd in no_decay) and any(nd in n for nd in group2)],'weight_decay': args.weight_decay, 'lr': args.learning_rate},
+            {'params': [p for n, p in model.bert.named_parameters() if not any(nd in n for nd in no_decay) and any(nd in n for nd in group3)],'weight_decay': args.weight_decay, 'lr': args.learning_rate*2.6},
+            {'params': [p for n, p in model.bert.named_parameters() if any(nd in n for nd in no_decay) and not any(nd in n for nd in group_all)],'weight_decay': 0.0},
+            {'params': [p for n, p in model.bert.named_parameters() if any(nd in n for nd in no_decay) and any(nd in n for nd in group1)],'weight_decay': 0.0, 'lr': args.learning_rate/2.6},
+            {'params': [p for n, p in model.bert.named_parameters() if any(nd in n for nd in no_decay) and any(nd in n for nd in group2)],'weight_decay': 0.0, 'lr': args.learning_rate},
+            {'params': [p for n, p in model.bert.named_parameters() if any(nd in n for nd in no_decay) and any(nd in n for nd in group3)],'weight_decay': 0.0, 'lr': args.learning_rate*2.6},
+            {'params': [p for n, p in model.named_parameters() if "bert" not in n], 'lr':args.learning_rate*20, "weight_decay": 0.0},
+        ]
+        """
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
             {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
             {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
             ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+        """
+        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=t_total * args.warmup_steps, t_total=t_total)
+        if args.fgm:
+            fgm = FGM(model)
 
         # Train!
         logger.info("***** Running training *****")
@@ -254,8 +283,7 @@ def main():
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, label_ids = batch
-                outputs = model(input_ids, label_ids, segment_ids, input_mask)
-                loss = outputs
+                loss = model(input_ids, label_ids, segment_ids, input_mask)
 
                 if n_gpu > 1:
                     loss = loss.mean() # mean() to average on multi-gpu.
@@ -264,9 +292,15 @@ def main():
 
                 loss.backward()
                 tr_loss += loss.item()
+                if args.fgm:
+                    fgm.attack()
+                    loss = model(input_ids, label_ids, segment_ids, input_mask)
+                    loss.backward()
+                    fgm.restore()
+
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     optimizer.step()
-                    scheduler.step()  # Update learning rate schedule
+                    scheduler.step()
                     model.zero_grad()
                     global_step += 1
                     
@@ -290,8 +324,9 @@ def main():
                     logger.info(f"----------the best f1 is {f1_score}---------")
                     best_f1 = f1_score
                     model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
-                    model_to_save.save_pretrained(args.output_dir)
-                    tokenizer.save_pretrained(args.output_dir)
+                    # model_to_save.save_pretrained(args.output_dir)
+                    # tokenizer.save_pretrained(args.output_dir)
+                    torch.save(model_to_save, os.path.join(args.output_dir, 'best_model.pt'))
 
                     # Good practice: save your training arguments together with the trained model
                     torch.save(args, os.path.join(args.output_dir, 'training_args.bin'))
@@ -313,9 +348,11 @@ def main():
         # model.to(device)
         label_map = {i : label for i, label in enumerate(label_list)}
 
-        tokenizer = BertTokenizer.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         args = torch.load(os.path.join(args.output_dir, 'training_args.bin'))
-        model = BERT_BiLSTM_CRF.from_pretrained(args.output_dir, need_birnn=args.need_birnn, rnn_dim=args.rnn_dim)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, do_lower_case=args.do_lower_case)
+        # tokenizer = BertTokenizer.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
+        # model = BERT_BiLSTM_CRF.from_pretrained(args.output_dir, need_birnn=args.need_birnn, rnn_dim=args.rnn_dim)
+        model = torch.load(os.path.join(args.output_dir, 'best_model.pt'))
         model.to(device)
 
         test_examples, test_features, test_data = get_Dataset(args, processor, tokenizer, mode="test")
@@ -354,13 +391,23 @@ def main():
         assert len(pred_labels) == len(all_ori_tokens) == len(all_ori_labels)
         print(len(pred_labels))
         with open(os.path.join(args.output_dir, "token_labels_.txt"), "w", encoding="utf-8") as f:
-            for ori_tokens, ori_labels,prel in zip(all_ori_tokens, all_ori_labels, pred_labels):
-                for ot,ol,pl in zip(ori_tokens, ori_labels, prel):
-                    if ot in ["[CLS]", "[SEP]"]:
-                        continue
-                    else:
-                        f.write(f"{ot} {ol} {pl}\n")
-                f.write("\n")
+            count = 0
+            for ori_tokens, ori_labels, prel in zip(all_ori_tokens, all_ori_labels, pred_labels):
+                count += 1
+                # sentence
+                sentences = ""
+                for token in ori_tokens[1: -1]:
+                    sentences += token
+                # labels
+                prel_bieso = convert_bio2bieso(prel[1: -1])
+                assert len(ori_tokens[1: -1]) == len(prel_bieso)
+                labels = ""
+                for label in prel_bieso:
+                    labels += label
+                    labels += " "
+                labels = labels[: -1]
+                f.write(f"{count}\u0001{sentences}\u0001{labels}\n")
+                
 
 if __name__ == "__main__":
     main()
